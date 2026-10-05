@@ -562,6 +562,40 @@ class LossCostAllocationAccount(Base):
     )
 
 
+class MaintenancePlan(Base):
+    """车间按设备提交的计划保养单（提交后不可变，只追加）。
+
+    - plan_no 为全局唯一单号；期间 [start_ts, end_ts) 带时区整分钟、半开；
+    - windows 为非空保养窗口列表（规范化、按起点升序），每窗口完整落在
+      期间内、窗口间互不重叠（半开，端点相接允许）；
+    - 同设备计划期间不得重叠（应用层校验 + gist 排他约束兜底，端点相接允许）；
+    - content_hash 为规范化提交内容（时间归一 UTC 整分钟，窗口顺序无关）：
+      同单号同内容重试幂等返回原单（窗口换序、等价时区仍算同内容），
+      同单号异内容 409 冲突；提交后不提供任何修改入口。
+    """
+
+    __tablename__ = "maintenance_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    device_id: Mapped[str] = mapped_column(
+        ForeignKey("devices.id"), nullable=False, index=True
+    )
+    # 规范化提交内容哈希（同内容判定，与窗口列表顺序无关）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # 规范化保养窗口（按起点升序）：[{"start_ts", "end_ts"}, ...]
+    windows: Mapped[list] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("end_ts > start_ts", name="ck_maintenance_plans_valid_range"),
+    )
+
+
 class LossCostAllocationSplit(Base):
     """分摊来源明细：一条损失账切分明细 × 一个去向（某批次或未分配的一段区间）。
 

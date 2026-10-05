@@ -14,7 +14,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import attribution, pricing, reconciliation, allocation, closing
+from . import attribution, pricing, reconciliation, allocation, closing, maintenance
 from .attribution import EventView, RulingView
 from .config import settings
 from .models import (
@@ -29,6 +29,7 @@ from .models import (
     LossCostAllocationSplit,
     LossPeriodClosing,
     LossPeriodClosingItem,
+    MaintenancePlan,
     ManualAdjudication,
     RateEntry,
     RateVersion,
@@ -2602,3 +2603,297 @@ def list_device_loss_period_closings(
         .all()
     )
     return [(h, _closing_items(db, h.id)) for h in heads]
+
+
+# ------------------------------------------------ 计划保养提交与核对
+
+
+def _maintenance_plan_hash(
+    device_id: str,
+    start: datetime,
+    end: datetime,
+    windows: list[tuple[datetime, datetime]],
+) -> str:
+    """规范化计划内容 → sha256（时间归一 UTC 整分钟 ISO 串，窗口顺序无关）。"""
+    canonical_windows = sorted(
+        ((_utc(s), _utc(e)) for s, e in windows),
+        key=lambda w: (w[0], w[1]),
+    )
+    payload = {
+        "device_id": device_id,
+        "start": _utc(start).isoformat(),
+        "end": _utc(end).isoformat(),
+        "windows": [
+            {"start": s.isoformat(), "end": e.isoformat()} for s, e in canonical_windows
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def submit_maintenance_plan(
+    db: Session, payload
+) -> tuple[MaintenancePlan, bool]:
+    """提交计划保养单（提交后不可变；同单号同内容幂等，异内容冲突）。
+
+    返回 (计划单, 是否幂等命中)。
+    - 窗口非空、完整落在期间内、互不重叠；同设备各计划单期间不得重叠
+      （半开，端点相接允许）——任一非法整单拒绝，不留痕；
+    - 同单号同内容重试返回原单（200，idempotent=True，窗口换序、等价时区
+      仍算同内容）；同单号异内容 409 MAINTENANCE_PLAN_CONFLICT；
+    - 与同设备既有计划期间重叠 409 MAINTENANCE_PLAN_OVERLAP；
+    - 未知设备 404 DEVICE_NOT_FOUND。
+    """
+    get_device_or_404(db, payload.device_id)
+    win_start, win_end = _utc(payload.start), _utc(payload.end)
+    raw_windows = [(_utc(w.start), _utc(w.end)) for w in payload.windows]
+    try:
+        norm_windows = maintenance.normalize_windows(
+            (win_start, win_end), raw_windows
+        )
+    except maintenance.MaintenancePlanError as exc:
+        raise ApiError(422, "MAINTENANCE_WINDOW_INVALID", str(exc))
+
+    content_hash = _maintenance_plan_hash(
+        payload.device_id, win_start, win_end, raw_windows
+    )
+
+    # 单号行锁：同单号的并发提交串行（先查既有单：同内容幂等 / 异内容冲突）
+    existing = db.execute(
+        select(MaintenancePlan)
+        .where(MaintenancePlan.plan_no == payload.plan_no)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.content_hash != content_hash:
+            raise ApiError(
+                409,
+                "MAINTENANCE_PLAN_CONFLICT",
+                f"plan_no {payload.plan_no!r} already exists with different content",
+            )
+        db.commit()  # 释放单号行锁
+        return existing, True
+
+    # 同设备期间重叠（半开判定：start < other.end AND end > other.start）
+    conflict = (
+        db.execute(
+            select(MaintenancePlan).where(
+                MaintenancePlan.device_id == payload.device_id,
+                MaintenancePlan.start_ts < win_end,
+                MaintenancePlan.end_ts > win_start,
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if conflict is not None:
+        raise ApiError(
+            409,
+            "MAINTENANCE_PLAN_OVERLAP",
+            f"plan period [{win_start.isoformat()}, {win_end.isoformat()}) overlaps "
+            f"existing plan {conflict.plan_no!r} "
+            f"[{conflict.start_ts.isoformat()}, {conflict.end_ts.isoformat()}) "
+            f"on device {payload.device_id!r}",
+        )
+
+    plan = MaintenancePlan(
+        plan_no=payload.plan_no,
+        device_id=payload.device_id,
+        content_hash=content_hash,
+        start_ts=win_start,
+        end_ts=win_end,
+        windows=[
+            {"start_ts": s.isoformat(), "end_ts": e.isoformat()}
+            for s, e in norm_windows
+        ],
+    )
+    db.add(plan)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 单号唯一 / 期间排他约束兜底并发竞争：整体回滚后重新判定
+        db.rollback()
+        winner = db.execute(
+            select(MaintenancePlan).where(
+                MaintenancePlan.plan_no == payload.plan_no
+            )
+        ).scalar_one_or_none()
+        if winner is not None:
+            if winner.content_hash != content_hash:
+                raise ApiError(
+                    409,
+                    "MAINTENANCE_PLAN_CONFLICT",
+                    f"plan_no {payload.plan_no!r} already exists with different content",
+                )
+            return winner, True
+        # 单号不同：并发提交的同设备重叠单先提交
+        raise ApiError(
+            409,
+            "MAINTENANCE_PLAN_OVERLAP",
+            "plan period overlaps a concurrently submitted plan on this device",
+        )
+    db.refresh(plan)
+    return plan, False
+
+
+def get_maintenance_plan(db: Session, plan_no: str) -> MaintenancePlan:
+    plan = db.execute(
+        select(MaintenancePlan).where(MaintenancePlan.plan_no == plan_no)
+    ).scalar_one_or_none()
+    if plan is None:
+        raise ApiError(
+            404, "MAINTENANCE_PLAN_NOT_FOUND", f"unknown plan_no: {plan_no!r}"
+        )
+    return plan
+
+
+def list_device_maintenance_plans(
+    db: Session, device_id: str
+) -> list[MaintenancePlan]:
+    """列出设备的全部计划保养单（按提交先后；未知设备 404）。"""
+    get_device_or_404(db, device_id)
+    return list(
+        db.execute(
+            select(MaintenancePlan)
+            .where(MaintenancePlan.device_id == device_id)
+            .order_by(MaintenancePlan.id)
+        )
+        .scalars()
+        .all()
+    )
+
+
+def _plan_windows(plan: MaintenancePlan) -> list[tuple[datetime, datetime]]:
+    return [
+        (
+            datetime.fromisoformat(w["start_ts"]),
+            datetime.fromisoformat(w["end_ts"]),
+        )
+        for w in sorted(plan.windows, key=lambda w: w["start_ts"])
+    ]
+
+
+def check_maintenance_plan(
+    db: Session, plan_no: str, seq: int | None
+) -> tuple[MaintenancePlan, dict]:
+    """按单号核对计划保养执行情况（固定变更序号，可重放）。
+
+    - seq 缺省时固定为查询开始时已提交的最大变更序号；超过当前最大序号
+      明确报错（不以现态推算）；
+    - 取与计划期间相交、截至 seq 已结算的班次，每班取序号 ≤ seq 的最后修订
+      及其**固化归因段**（只用保养段参与判定，覆盖范围用班次区间）；
+    - 计划窗口中未被已结算班次覆盖的分钟单列未核实；所需历史修订缺固化段
+      （结构引入前的历史修订）→ 422 SEGMENTS_UNAVAILABLE，整次查询报不可用。
+    返回 (计划单, 核对结果 dict)。未知单号 404 MAINTENANCE_PLAN_NOT_FOUND。
+    """
+    plan = get_maintenance_plan(db, plan_no)
+    win_start, win_end = plan.start_ts, plan.end_ts
+
+    max_committed_seq = _current_max_seq(db)
+    if seq is None:
+        pinned_seq = max_committed_seq  # 固定查询开始时的最新序号
+    elif seq > max_committed_seq:
+        raise ApiError(
+            422,
+            "INVALID_SEQ",
+            f"maintenance check seq {seq} is beyond the latest committed change "
+            f"seq {max_committed_seq}; omit seq to pin the current maximum or "
+            f"specify a seq no greater than {max_committed_seq} (0 allowed)",
+        )
+    else:
+        pinned_seq = seq
+
+    # 每班次截至 pinned_seq 的最后修订（与班次快照/对账/结账同一选择规则）
+    last_rev_subq = (
+        select(
+            ShiftResult.shift_id.label("shift_id"),
+            func.max(ShiftResult.revision).label("max_revision"),
+        )
+        .where(ShiftResult.seq <= pinned_seq)
+        .group_by(ShiftResult.shift_id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(Shift, ShiftResult)
+        .join(ShiftResult, ShiftResult.shift_id == Shift.id)
+        .join(
+            last_rev_subq,
+            and_(
+                last_rev_subq.c.shift_id == ShiftResult.shift_id,
+                last_rev_subq.c.max_revision == ShiftResult.revision,
+            ),
+        )
+        .where(
+            Shift.device_id == plan.device_id,
+            Shift.start_ts < win_end,
+            Shift.end_ts > win_start,
+        )
+        .order_by(Shift.id)
+    ).all()
+
+    shift_views: list[maintenance.ShiftView] = []
+    basis: list[dict] = []
+    for shift, rev in rows:
+        if not rev.segments_available:
+            raise ApiError(
+                422,
+                "SEGMENTS_UNAVAILABLE",
+                f"shift id={shift.id} revision {rev.revision} (seq={rev.seq}) "
+                "has no frozen result segments; the historical ruling state "
+                "cannot be reliably reconstructed, so the maintenance check at "
+                f"seq={pinned_seq} is refused (current state is never substituted)",
+            )
+        seg_rows = (
+            db.execute(
+                select(
+                    ShiftResultSegment.start_ts,
+                    ShiftResultSegment.end_ts,
+                    ShiftResultSegment.reason,
+                )
+                .where(
+                    ShiftResultSegment.shift_id == shift.id,
+                    ShiftResultSegment.revision == rev.revision,
+                )
+                .order_by(ShiftResultSegment.seg_no)
+            )
+            .all()
+        )
+        shift_views.append(
+            maintenance.ShiftView(
+                shift_id=shift.id,
+                revision=rev.revision,
+                seq=rev.seq,
+                coverage=(shift.start_ts, shift.end_ts),
+                segments=[((s, e), reason) for s, e, reason in seg_rows],
+            )
+        )
+        basis.append(
+            {
+                "shift_id": shift.id,
+                "revision": rev.revision,
+                "seq": rev.seq,
+                "shift_start": shift.start_ts,
+                "shift_end": shift.end_ts,
+            }
+        )
+
+    result = maintenance.check_maintenance(
+        (win_start, win_end), _plan_windows(plan), shift_views
+    )
+    window_minutes = sum(
+        int((e - s).total_seconds()) // 60 for s, e in _plan_windows(plan)
+    )
+    return plan, {
+        "seq": pinned_seq,
+        "executed": result.executed,
+        "not_executed": result.not_executed,
+        "unplanned": result.unplanned,
+        "unverified": result.unverified,
+        "executed_minutes": result.executed_minutes,
+        "not_executed_minutes": result.not_executed_minutes,
+        "unplanned_minutes": result.unplanned_minutes,
+        "unverified_minutes": result.unverified_minutes,
+        "window_minutes": window_minutes,
+        "covered_minutes": result.covered_minutes,
+        "basis": basis,
+    }

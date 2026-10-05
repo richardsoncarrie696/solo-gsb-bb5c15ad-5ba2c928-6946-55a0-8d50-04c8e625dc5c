@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→按批次分摊停机成本→按设备期间停机损失结账 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→按批次分摊停机成本→按设备期间停机损失结账 全流程。# 计划保养提交与核对
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -316,3 +316,35 @@ req POST /devices/CNC-01/loss-closings '{"device_id":"CNC-01","closing_no":"LC-S
 req POST /devices/CNC-01/loss-closings '{"device_id":"CNC-01","closing_no":"LC-SMOKE-BAD2","start":"2026-10-01T00:00:00+08:00","end":"2026-10-03T00:00:00+08:00","seq":1,"rate_version":999}'
 req GET /loss-closings/NOPE
 req POST /devices/CNC-01/loss-closings '{"device_id":"CNC-01","closing_no":"LC-SMOKE-BAD3","start":"2026-10-03T00:00:00+08:00","end":"2026-10-01T00:00:00+08:00","seq":1,"rate_version":1}'
+
+echo "-- 计划保养核对：提交计划单（多窗口、非整点排序），期间 10/1 全天 --"
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-001","start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","windows":[
+  {"start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:00:00+08:00"},
+  {"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"}]}'
+
+echo "-- 同单号同内容重试（窗口换序、等价 UTC 时区）：预期 200 idempotent=true --"
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-001","start":"2026-09-30T16:00:00Z","end":"2026-10-01T16:00:00Z","windows":[
+  {"start":"2026-10-01T02:00:00Z","end":"2026-10-01T03:00:00Z"},
+  {"start":"2026-10-01T03:00:00Z","end":"2026-10-01T04:00:00Z"}]}'
+
+echo "-- 按单号读取 / 列出设备计划单 --"
+req GET /maintenance-plans/MP-SMOKE-001
+req GET /devices/CNC-01/maintenance-plans
+
+echo "-- 核对（seq 缺省固定查询开始时最新序号；窗口 10-11 与 11-12 的实际执行看各修订）--"
+req GET /maintenance-plans/MP-SMOKE-001/check
+
+echo "-- 固定 seq=1 重放（只取序号不大于 1 的最后修订及固化归因段，结果不可变）--"
+req GET /maintenance-plans/MP-SMOKE-001/check?seq=1
+
+echo "-- 核对错误：序号越界 422 INVALID_SEQ / 未知单号 404 MAINTENANCE_PLAN_NOT_FOUND --"
+req GET /maintenance-plans/MP-SMOKE-001/check?seq=999999
+req GET /maintenance-plans/NOPE/check
+
+echo "-- 提交错误：同单号异内容 409 MAINTENANCE_PLAN_CONFLICT / 期间重叠 409 MAINTENANCE_PLAN_OVERLAP / 窗口越界 422 MAINTENANCE_WINDOW_INVALID --"
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-001","start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","windows":[
+  {"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T10:30:00+08:00"}]}'
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-002","start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T20:00:00+08:00","windows":[
+  {"start":"2026-10-01T09:00:00+08:00","end":"2026-10-01T09:30:00+08:00"}]}'
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-003","start":"2026-10-03T00:00:00+08:00","end":"2026-10-04T00:00:00+08:00","windows":[
+  {"start":"2026-10-02T23:00:00+08:00","end":"2026-10-03T01:00:00+08:00"}]}'

@@ -733,3 +733,115 @@ class LossPeriodClosingOut(BaseModel):
     totals: ClosingTotals
     items: list[ClosingItemOut]
     created_at: datetime
+
+
+# ------------------------------------------------ 计划保养核对
+
+
+class MaintenanceWindowIn(_Interval):
+    """一个计划保养窗口（整分钟、半开）；须落在计划期间内，窗口间互不重叠。"""
+
+
+class MaintenancePlanIn(BaseModel):
+    """车间按设备提交的计划保养单。
+
+    - 设备号 + 全局唯一单号 + 带时区整分钟的半开期间 [start, end)；
+    - windows 为非空保养窗口列表：每窗口完整落在期间内、窗口互不重叠
+      （半开，端点相接允许）；同设备各计划单的期间不得重叠；
+    - 提交后不可改：同单号同内容重试幂等（窗口换序、等价时区仍算同内容），
+      同单号异内容冲突。
+    """
+
+    device_id: str = Field(min_length=1, max_length=64)
+    plan_no: str = Field(
+        min_length=1,
+        max_length=64,
+        description="全局唯一保养计划单号：同单号同内容重试幂等，异内容冲突",
+        examples=["MP-202610-001"],
+    )
+    start: datetime = Field(description="计划期间起点（含），带时区整分钟")
+    end: datetime = Field(description="计划期间终点（不含），带时区整分钟")
+    windows: list[MaintenanceWindowIn] = Field(
+        min_length=1, description="保养窗口列表（顺序不影响同内容判定）"
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _ts(cls, v: datetime) -> datetime:
+        return _check_ts(v)
+
+    @model_validator(mode="after")
+    def _range(self):
+        if not self.start < self.end:
+            raise ValueError("invalid plan period: start must be earlier than end")
+        return self
+
+
+class MaintenanceWindowOut(BaseModel):
+    """固化的保养窗口（按起点升序，UTC 输出）。"""
+
+    start: datetime
+    end: datetime
+    minutes: int
+
+
+class MaintenancePlanOut(BaseModel):
+    """一次固化的计划保养单（提交后不可改；同单号同内容重试原样返回）。"""
+
+    id: int
+    plan_no: str
+    device_id: str
+    idempotent: bool  # True 表示同单号同内容重试，返回原固化单
+    start: datetime
+    end: datetime
+    windows: list[MaintenanceWindowOut]
+    created_at: datetime
+
+
+class MaintenanceInterval(BaseModel):
+    """核对结果中的最大连续半开区间（UTC 输出）及分钟数。"""
+
+    start: datetime
+    end: datetime
+    minutes: int
+
+
+class MaintenanceShiftBasis(BaseModel):
+    """核对所用的各已结算班次及其固定序号下选取的修订（便于重放核对）。"""
+
+    shift_id: int
+    revision: int
+    seq: int  # 该修订的全局变更序号（均 ≤ 核对所用序号）
+    shift_start: datetime
+    shift_end: datetime
+
+
+class MaintenanceCheckOut(BaseModel):
+    """按设备核对计划保养执行情况的结果（固定变更序号，可重放）。
+
+    - executed（已执行）：保养窗口与"保养"归因段的交集最大连续区间；
+    - not_executed（未执行）：保养窗口内已被已结算班次覆盖、但非保养的分钟
+      （故障/待判，以及无停机归因的正常生产分钟）；
+    - unplanned（计划外）：期间内保养窗口之外出现的保养段区间；
+    - unverified（未核实）：保养窗口中未被任何已结算班次覆盖的分钟
+      （单列，不计未执行）；
+    - seq：本次实际使用的变更序号（缺省固定为查询开始时最新序号），
+      basis 给出所用班次修订依据，可据此重放。
+    """
+
+    plan_no: str
+    device_id: str
+    start: datetime
+    end: datetime
+    seq: int
+    executed: list[MaintenanceInterval]
+    executed_minutes: int
+    not_executed: list[MaintenanceInterval]
+    not_executed_minutes: int
+    unplanned: list[MaintenanceInterval]
+    unplanned_minutes: int
+    unverified: list[MaintenanceInterval]
+    unverified_minutes: int
+    window_minutes: int  # 全部保养窗口分钟总数（已执行 + 未执行 + 未核实）
+    covered_minutes: int  # 期间内已结算班次覆盖的分钟总数
+    basis: list[MaintenanceShiftBasis]

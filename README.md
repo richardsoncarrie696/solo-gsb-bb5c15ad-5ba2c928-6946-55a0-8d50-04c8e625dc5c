@@ -42,6 +42,17 @@
 账引用与按原因汇总的金额/定价/待定价分钟，任一修订缺少固化明细则整单失败；
 无符合班次固化空结账，同单号同输入重试返回原结账、异输入冲突，历史结账随后续
 事件更正、费率发布与重新核算**永不改变**。
+车间还可**按设备核对计划保养是否执行**
+（`POST /devices/{id}/maintenance-plans` 提交、`GET /maintenance-plans/{no}/check` 核对）：
+计划含设备号、**全局唯一单号**、带时区整分钟的半开期间与非空保养窗口（窗口须在
+期间内且互不重叠，同设备各计划期间不得重叠，端点相接均允许）；提交后计划不可改，
+同单号同内容重试幂等（**窗口换序、等价时区仍算同内容**），异内容冲突。核对按单号
+与可选全局变更序号进行（缺省固定为查询开始时最新序号），只取序号不大于该值的
+**已结算班次最后修订及其固化归因段**：计划窗口与"保养"段交集计**已执行**，窗口内
+已结算但非保养分钟计**未执行**，期间内窗口外的"保养"计**计划外**，计划窗口中
+未被已结算班次覆盖的分钟单列**未核实**（不计未执行）；返回各类最大连续半开区间、
+分钟汇总、所用序号与班次修订依据。未知设备/单号、越过最新变更的序号明确报错，
+所需历史修订缺固化段则整次查询报不可用，**绝不以现态推算**。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -147,6 +158,23 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
   非法游标/超限页大小返回 `422`。
 - **错误**：未知设备 `404 DEVICE_NOT_FOUND`，非法区间 `422`，未结算 `404 RESULT_NOT_FOUND`，
   未知班次/修订 `404`。错误体统一为 `{"detail": {"code": "...", "message": "..."}}`。
+- **计划保养核对**（`POST /devices/{id}/maintenance-plans` 提交、
+  `GET /maintenance-plans/{no}/check?seq=` 核对）：
+  - 计划含设备号、**全局唯一单号**、带时区整分钟半开期间与**非空**保养窗口；
+    每个窗口须完整落在期间内、窗口互不重叠（端点相接允许），同设备各计划**期间
+    不得重叠**（端点相接允许；应用校验 + gist 排他约束双保险）；
+  - 提交后**不可改**：同单号同内容重试幂等（`200`，`idempotent=true`），
+    **窗口换序、等价时区仍算同内容**；同单号异内容 `409 MAINTENANCE_PLAN_CONFLICT`；
+    同设备期间重叠 `409 MAINTENANCE_PLAN_OVERLAP`；窗口空/越界/重叠
+    `422 MAINTENANCE_WINDOW_INVALID`；
+  - 核对 `seq` 缺省时**固定查询开始时最新序号**，越过最新序号 `422 INVALID_SEQ`；
+    只取 `seq ≤ 该值`的已结算班次**最后修订及其固化归因段**：窗口 ∩ 保养段 =
+    **已执行**，窗口内已结算但非保养分钟 = **未执行**（含正常生产分钟），
+    期间内窗口外保养段 = **计划外**，窗口中未被已结算班次覆盖分钟 = **未核实**
+    （单列、不计未执行）；返回各类最大连续半开区间、分钟汇总、所用序号与
+    班次修订依据；未知单号 `404 MAINTENANCE_PLAN_NOT_FOUND`，所需历史修订缺
+    固化段 → `422 SEGMENTS_UNAVAILABLE` 整次查询不可用，**不以现态推算**。
+
 - **停机损失费率版本**（按设备）：
   - `POST /devices/{id}/rate-versions` 一次发布**完整费率表**：每行含原因（保养/故障/待判）、
     带时区且精确到整分钟的半开生效区间 `[start, end)` 与**非负**每分钟金额（十进制字符串，
@@ -236,6 +264,10 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/devices/{device_id}/loss-closings` | 按设备封存一个期间的停机损失结账（首次 201 / 同单号同输入 200 / 异输入 409；整单全或无） |
 | `GET` | `/loss-closings/{closing_no}` | 按单号读取固化的期间停机损失结账及明细（未知单号 404） |
 | `GET` | `/devices/{device_id}/loss-closings` | 列出设备的全部固化期间结账 |
+| `POST` | `/devices/{device_id}/maintenance-plans` | 提交计划保养单（首次 201 / 同单号同内容 200 / 异内容 409；窗口或期间非法、同设备期间重叠 409/422） |
+| `GET` | `/maintenance-plans/{plan_no}` | 按单号读取固化的计划保养单（未知单号 404） |
+| `GET` | `/devices/{device_id}/maintenance-plans` | 列出设备的全部计划保养单 |
+| `GET` | `/maintenance-plans/{plan_no}/check?seq=` | 按单号核对计划保养执行情况（固定序号；返回已执行/未执行/计划外/未核实的最大连续区间与分钟汇总、所用序号及修订依据） |
 | `GET` | `/health` | 健康检查 |
 
 原因枚举：`maintenance`（保养）、`failure`（故障）、`pending`（待判）。
@@ -271,6 +303,10 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 404 | `ALLOCATION_NOT_FOUND` | 未知分摊单号 |
 | 409 | `CLOSING_CONFLICT` | 结账单号已存在但提交输入不同（设备/期间/截止序号/费率版本；同单号同输入重试才幂等） |
 | 404 | `CLOSING_NOT_FOUND` | 未知结账单号 |
+| 409 | `MAINTENANCE_PLAN_CONFLICT` | 保养计划单号已存在但提交内容不同（窗口换序、等价时区才算同内容；同单号同内容重试才幂等） |
+| 409 | `MAINTENANCE_PLAN_OVERLAP` | 同设备计划期间互相重叠（半开，端点相接允许） |
+| 422 | `MAINTENANCE_WINDOW_INVALID` | 保养窗口非法：空列表、窗口越出计划期间、窗口互相重叠、窗口倒置 |
+| 404 | `MAINTENANCE_PLAN_NOT_FOUND` | 未知保养计划单号 |
 
 ## 调用示例
 
@@ -1361,6 +1397,114 @@ curl http://localhost:8000/devices/CNC-01/loss-closings
 # 期间缺时区/start≥end → 422 VALIDATION_ERROR
 ```
 
+## 计划保养核对（按设备，按固定变更序号）
+
+车间按设备核对计划保养是否执行。先**提交计划保养单**（提交后不可改），随后可随时
+按单号在**固定变更序号**下核对；核对只读取已结算班次修订的不可变固化归因段，
+历史结果可重放、不随后续更正改变。
+
+### 提交规则
+
+`POST /devices/{device_id}/maintenance-plans`，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `device_id` | 设备号（须与路径一致） |
+| `plan_no` | **全局唯一单号**（如 `MP-202610-001`） |
+| `start` / `end` | 计划期间：带时区、整分钟的**半开**区间 `[start, end)` |
+| `windows` | **非空**保养窗口列表，每个为整分钟半开区间 |
+
+- 每个窗口必须完整落在期间内（窗口端点可与期间端点相等）；
+- 窗口之间互不重叠（半开：`[a,b)` 与 `[b,c)` 端点相接合法）；
+- 同设备各计划单的**期间不得重叠**（端点相接合法）；不同设备互不影响；
+- 提交后计划**不可改**（无更新/删除入口，只追加）：
+  - 同单号**同内容**重试 → `200` 且 `idempotent=true`，返回原单；
+    **窗口换序、等价时区（如 `+08:00` 与对应 `Z`）仍算同内容**，
+    返回的窗口统一按起点升序、UTC 归一化；
+  - 同单号**异内容**（期间或窗口不同）→ `409 MAINTENANCE_PLAN_CONFLICT`。
+
+### 核对规则
+
+`GET /maintenance-plans/{plan_no}/check?seq=N`（`seq` 可选）：
+
+- `seq` 缺省时**固定为查询开始时已提交的最大变更序号**；响应回传实际所用 `seq`，
+  带同一 `seq` 重放结果恒等；`seq` 越过当前最新序号 → `422 INVALID_SEQ`（`0` 合法）；
+- 只纳入与计划期间相交、且截至 `seq` **已结算**的班次，每班取序号 `≤ seq` 的
+  **最后修订及其同事务固化的归因段**（与班次快照/对账/结账同一选择规则）；
+- 逐分钟四类（互不重叠，均返回**最大连续半开区间**与分钟总数）：
+
+| 类别 | 含义 |
+| --- | --- |
+| `executed` 已执行 | 计划窗口 ∩ 固化"保养(maintenance)"段 |
+| `not_executed` 未执行 | 窗口内**已被已结算班次覆盖**但非保养的分钟：故障/待判分钟，以及班次内无任何停机归因的正常生产分钟 |
+| `unplanned` 计划外 | 期间内、计划窗口之外出现的"保养"段 |
+| `unverified` 未核实 | 计划窗口中**未被任何已结算班次覆盖**的分钟（单列，**不计未执行**） |
+
+- 响应另含 `window_minutes`（窗口总分钟 = 已执行 + 未执行 + 未核实）、
+  `covered_minutes`（期间内已结算覆盖分钟）与 `basis`（所用各班次的修订号、
+  修订序号 `seq` 及班次区间，便于核对重放）；
+- 所需历史修订缺少固化明细（结构引入前的历史修订）→ `422 SEGMENTS_UNAVAILABLE`，
+  **整次查询报不可用，绝不以当前状态推算**；未知单号 → `404 MAINTENANCE_PLAN_NOT_FOUND`。
+
+### 调用示例
+
+```bash
+# 1) 提交计划单：10/1 全天期间，两个保养窗口 10:00-11:00、11:00-12:00（列表故意乱序）
+curl -sS -X POST http://localhost:8000/devices/CNC-01/maintenance-plans \
+  -H 'Content-Type: application/json' -d '{
+    "device_id":"CNC-01","plan_no":"MP-202610-001",
+    "start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00",
+    "windows":[
+      {"start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:00:00+08:00"},
+      {"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"}]}'
+# 201（窗口回显已按起点升序、UTC 归一）
+# {"id":1,"plan_no":"MP-202610-001","idempotent":false,
+#  "start":"2026-09-30T16:00:00Z","end":"2026-10-01T16:00:00Z",
+#  "windows":[{"start":"2026-10-01T02:00:00Z","end":"...03:00:00Z","minutes":60},
+#             {"start":"2026-10-01T03:00:00Z","end":"...04:00:00Z","minutes":60}], ...}
+
+# 2) 同单号同内容重试：窗口换序 + 等价 UTC 时区，仍是同内容 → 200 idempotent=true
+curl -sS -X POST http://localhost:8000/devices/CNC-01/maintenance-plans \
+  -H 'Content-Type: application/json' -d '{
+    "device_id":"CNC-01","plan_no":"MP-202610-001",
+    "start":"2026-09-30T16:00:00Z","end":"2026-10-01T16:00:00Z",
+    "windows":[
+      {"start":"2026-10-01T02:00:00Z","end":"2026-10-01T03:00:00Z"},
+      {"start":"2026-10-01T03:00:00Z","end":"2026-10-01T04:00:00Z"}]}'
+
+# 3) 读取与列表
+curl http://localhost:8000/maintenance-plans/MP-202610-001
+curl http://localhost:8000/devices/CNC-01/maintenance-plans
+
+# 4) 核对（不传 seq → 固定当前最新序号）。假设班次 08:00-16:00 已结算：
+#    10:00-11:00 保养、11:00-12:00 故障；窗口 17:00-18:00 无已结算班次覆盖
+curl 'http://localhost:8000/maintenance-plans/MP-202610-001/check'
+# → {"plan_no":"MP-202610-001","seq":3,"window_minutes":120,"covered_minutes":480,
+#    "executed":[{"start":"2026-10-01T02:00:00Z","end":"2026-10-01T03:00:00Z","minutes":60}],
+#    "executed_minutes":60,
+#    "not_executed":[{"start":"...03:00:00Z","end":"...04:00:00Z","minutes":60}],
+#    "not_executed_minutes":60,
+#    "unplanned":[],"unplanned_minutes":0,
+#    "unverified":[],"unverified_minutes":0,
+#    "basis":[{"shift_id":1,"revision":1,"seq":3,"shift_start":"...","shift_end":"..."}]}
+
+# 计划窗口中未被已结算班次覆盖的分钟 → unverified（不计未执行）：
+# 若窗口为 10:00-18:00，则 16:00-18:00 无班次覆盖 → unverified 120 分钟，
+# 11:00-16:00 班次内非保养分钟 → not_executed。
+
+# 5) 固定历史序号重放：只取 seq ≤ 1 的最后修订；之后再更正结果也不变
+curl 'http://localhost:8000/maintenance-plans/MP-202610-001/check?seq=1'
+
+# 错误示例
+# seq 越过最新序号        → 422 INVALID_SEQ（省略 seq 即固定当前最大值；0 合法）
+# 历史修订无固化归因段    → 422 SEGMENTS_UNAVAILABLE（整次查询不可用，不以现态推算）
+# 同单号异内容            → 409 MAINTENANCE_PLAN_CONFLICT
+# 同设备计划期间重叠      → 409 MAINTENANCE_PLAN_OVERLAP
+# 窗口越出期间/互相重叠   → 422 MAINTENANCE_WINDOW_INVALID
+# 期间缺时区/start≥end    → 422 VALIDATION_ERROR
+# 未知设备                → 404 DEVICE_NOT_FOUND；未知单号 → 404 MAINTENANCE_PLAN_NOT_FOUND
+```
+
 ## 设计要点
 
 - **归因算法**（`app/attribution.py`，纯标准库可独立测试）：按原因收集区间并裁剪到班次窗口；
@@ -1476,6 +1620,22 @@ curl http://localhost:8000/devices/CNC-01/loss-closings
   结账只引用不可变的修订/费率/损失账，故事后的更正、费率发布与重新核算对
   历史结账完全免疫；条目冗余的账合计与按原因汇总使读回应答不依赖账被后续
   新增行影响（账本身本就不可变）。
+- **计划保养核对**：算法在 `app/maintenance.py`（纯标准库可独立测试）：
+  先 `normalize_windows` 校验非空、窗口完整落期间内、互不重叠（半开、端点相接
+  允许）并按起点排序；`check_maintenance` 把各班次所选修订的固化**保养段**与
+  班次覆盖区间统一裁剪到计划期间后做半开集合运算——已执行 = 窗口 ∩ 保养段，
+  未执行 =（窗口 ∩ 已结算覆盖）− 保养段，未核实 = 窗口 − 已结算覆盖，
+  计划外 = 保养段 − 窗口；差/交集经 `merge` 合并天然为按时间排序的最大连续
+  半开区间，四类互不重叠且窗口分钟守恒（已执行 + 未执行 + 未核实 = 窗口总分钟）。
+  固化为只追加表 `maintenance_plans`（单号全局唯一 + 规范化内容哈希 JSONB：
+  时间归一 UTC 整分钟、窗口按起点升序，**窗口换序与等价时区不影响同内容判定**；
+  gist 排他约束（`device_id WITH =` 与 `tstzrange(start_ts,end_ts,'[)') WITH &&`）
+  兜底同设备期间不重叠）。提交先锁
+  单号行（同内容幂等、异内容 `MAINTENANCE_PLAN_CONFLICT`），再做同设备期间
+  重叠校验，任一非法整体回滚不留痕；唯一/排他约束兜底并发竞争（竞争方转幂等
+  读取或重叠拒绝）。核对复用班次快照/对账/结账的"每组 `seq ≤ 序号`取最大
+  修订号"子查询，只读不可变的固化归因段；所选修订 `segments_available=FALSE`
+  或序号越界时整体拒绝，绝不以当前状态推算，响应回传固定序号与各班次修订依据。
 
 ## 项目结构
 
@@ -1488,6 +1648,7 @@ app/
   pricing.py      # 损失核算：定点金额、费率校验、按费率边界切分/逐段取整/待定价（纯标准库）
   allocation.py   # 按批次分摊：窗口交集分钟、整数分最大余数法（同余数批次升序/未分配最后）、待定价只分分钟（纯标准库）
   closing.py      # 期间结账：多份损失账合计与按原因汇总机械求和（空结账全 0，纯标准库）
+  maintenance.py  # 计划保养核对：窗口校验与已执行/未执行/计划外/未核实四类区间运算（纯标准库）
   models.py       # SQLAlchemy 模型
   schemas.py      # Pydantic 请求/响应与校验
   db.py           # 引擎、会话、建库建表（含排他约束）
@@ -1509,6 +1670,8 @@ tests/
   test_closing_alg.py           # 期间结账汇总算法单测（多账机械求和/空结账/账头明细一致性校验，无外部依赖，可 python3 直接跑）
   test_loss_cost_allocation.py  # 按批次分摊端到端（整单校验全或无/金额分钟守恒/幂等顺序无关/冲突/跨设备账/同班次多账/历史固化/并发唯一，需 PostgreSQL）
   test_loss_period_closing.py   # 期间结账端到端（期间内起始选取/截止序号选修订/形成复用账/空结账/幂等冲突/明细缺失整单失败/历史不变/并发唯一，需 PostgreSQL）
+  test_maintenance_alg.py       # 计划保养核对算法单测（窗口校验/四类分类/部分覆盖/最大连续区间/守恒，无外部依赖，可 python3 直接跑）
+  test_maintenance_plans.py     # 计划保养端到端（提交校验/幂等换序与时区/冲突/期间重叠/固定序号重放/未核实/明细不可用/错误语义，需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```
