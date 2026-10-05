@@ -46,6 +46,12 @@ from .schemas import (
     LossPeriodClosingOut,
     LossReasonTotal,
     LossTotal,
+    MaintenanceInterval,
+    MaintenancePlanIn,
+    MaintenancePlanOut,
+    MaintenancePlanWindowOut,
+    MaintenanceShiftRef,
+    MaintenanceVerificationOut,
     PricedPieceOut,
     RateEntryOut,
     RateVersionDetailOut,
@@ -81,7 +87,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -120,7 +126,17 @@ app = FastAPI(
         "按整班次取该序号前最后修订的固化归因段，沿用逐段计价与待定价规则形成或"
         "复用损失账；整单同事务固化所选修订、账引用及按原因汇总，任一修订缺少"
         "固化明细则整单失败，无符合班次固化空结账，同单号同输入重试返回原结账、"
-        "异输入冲突，历史结账不随后续更正/费率发布/重新核算改变。"
+        "异输入冲突，历史结账不随后续更正/费率发布/重新核算改变；"
+        "POST /devices/{device_id}/maintenance-plans 供车间提交计划保养单"
+        "（全局唯一单号、带时区整分钟的半开计划期间与非空保养窗口，窗口在期间内"
+        "且互不重叠，同设备计划期间不得重叠；提交后不可改，同单号同内容重试幂等"
+        "——窗口换序、等价时区仍算同内容，异内容冲突）；"
+        "GET /maintenance-plans/{plan_no}/verification 按单号与可选全局变更序号"
+        "核对计划保养：取序号不大于该值的相交已结算班次最后修订及其固化归因段，"
+        "窗口∩保养段计已执行、窗口内已结算但非保养计未执行、期间内窗口外保养段计"
+        "计划外、窗口未被已结算班次覆盖单列未核实（不计未执行），返回四类最大连续"
+        "半开区间、分钟汇总、所用序号与班次修订依据；历史修订缺固化明细整次查询"
+        "报不可用，绝不以现态推算。"
     ),
     lifespan=lifespan,
 )
@@ -1289,3 +1305,147 @@ def list_device_loss_period_closings_route(
     """列出设备的全部固化期间停机损失结账（按提交先后；未知设备 404）。"""
     data = services.list_device_loss_period_closings(db, device_id)
     return [_loss_period_closing_out(head, items, True) for head, items in data]
+
+
+# ---------------------------------------------------------------- 车间计划保养核对
+
+
+def _maintenance_window_out(w) -> MaintenancePlanWindowOut:
+    return MaintenancePlanWindowOut(
+        window_no=w.window_no,
+        start=w.start_ts,
+        end=w.end_ts,
+        minutes=int((w.end_ts - w.start_ts).total_seconds()) // 60,
+    )
+
+
+def _maintenance_plan_out(head, windows, idempotent: bool) -> MaintenancePlanOut:
+    return MaintenancePlanOut(
+        id=head.id,
+        plan_no=head.plan_no,
+        device_id=head.device_id,
+        idempotent=idempotent,
+        start=head.start_ts,
+        end=head.end_ts,
+        windows=[_maintenance_window_out(w) for w in windows],
+        created_at=head.created_at,
+    )
+
+
+def _maintenance_intervals(intervals: list) -> list[MaintenanceInterval]:
+    return [
+        MaintenanceInterval(
+            start=s,
+            end=e,
+            minutes=int((e - s).total_seconds()) // 60,
+        )
+        for s, e in intervals
+    ]
+
+
+@app.post(
+    "/devices/{device_id}/maintenance-plans",
+    response_model=MaintenancePlanOut,
+    tags=["maintenance-plans"],
+)
+def submit_maintenance_plan_route(
+    device_id: str,
+    payload: MaintenancePlanIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """车间按设备提交计划保养单（提交后不可改，全或无）。
+
+    - 计划期间 [start, end) 带时区、整分钟、非空；保养窗口非空、必须完全
+      落在期间内（可对齐端点）且互不重叠（半开、相接允许）；同设备计划
+      期间不得重叠（端点相接允许）；
+    - 同单号同内容重试返回原单（200，idempotent=true），首次 201；
+      同单号异内容 → 409 MAINTENANCE_PLAN_CONFLICT；同设备期间重叠
+      → 409 MAINTENANCE_PLAN_OVERLAP；窗口越界/重叠、空窗口、缺时区、
+      未对齐整分钟、期间倒置 → 422 VALIDATION_ERROR / MAINTENANCE_WINDOW_INVALID；
+      未知设备 → 404 DEVICE_NOT_FOUND；
+    - 窗口换序、等价时区仍算同内容（规范化内容哈希，时间归一 UTC）；
+      计划单一旦提交不可修改，核对见
+      GET /maintenance-plans/{plan_no}/verification。
+    """
+    if payload.device_id != device_id:
+        raise services.ApiError(
+            422,
+            "VALIDATION_ERROR",
+            f"device_id in body {payload.device_id!r} does not match path {device_id!r}",
+        )
+    head, windows, idempotent = services.submit_maintenance_plan(db, payload)
+    response.status_code = 200 if idempotent else 201
+    return _maintenance_plan_out(head, windows, idempotent)
+
+
+@app.get(
+    "/maintenance-plans/{plan_no}",
+    response_model=MaintenancePlanOut,
+    tags=["maintenance-plans"],
+)
+def get_maintenance_plan_route(plan_no: str, db: Session = Depends(get_db)):
+    """按单号读取固化的计划保养单（提交后不可改）。未知单号 404 MAINTENANCE_PLAN_NOT_FOUND。"""
+    head, windows = services.get_maintenance_plan(db, plan_no)
+    return _maintenance_plan_out(head, windows, True)
+
+
+@app.get(
+    "/devices/{device_id}/maintenance-plans",
+    response_model=list[MaintenancePlanOut],
+    tags=["maintenance-plans"],
+)
+def list_device_maintenance_plans_route(
+    device_id: str, db: Session = Depends(get_db)
+):
+    """列出设备的全部固化计划保养单（按提交先后；未知设备 404）。"""
+    data = services.list_device_maintenance_plans(db, device_id)
+    return [_maintenance_plan_out(head, windows, True) for head, windows in data]
+
+
+@app.get(
+    "/maintenance-plans/{plan_no}/verification",
+    response_model=MaintenanceVerificationOut,
+    tags=["maintenance-plans"],
+)
+def verify_maintenance_plan_route(
+    plan_no: str,
+    seq: int | None = Query(
+        default=None,
+        ge=0,
+        description="固定变更序号；缺省时以请求开始时已提交的最大序号为准",
+    ),
+    db: Session = Depends(get_db),
+):
+    """按单号核对计划保养是否执行（固定变更序号，只读取证、可重放）。
+
+    - 取与计划期间半开相交班次中、截至 seq 已结算班次的**最后修订**及其
+      **固化归因明细**：计划窗口与"保养"段的交集为 executed（已执行）；
+      窗口内已结算但非保养的分钟（故障/待判/未停机）为 not_executed
+      （未执行）；期间内窗口外的"保养"段为 unplanned（计划外）；计划窗口
+      中未被已结算班次覆盖的分钟为 unverified（未核实，单列、不计未执行）；
+    - 各类结果均为按时间顺序的最大连续半开区间，返回各自分钟汇总、本次
+      实际使用的 seq 及参与核对的班次修订依据（shifts）；
+    - seq 缺省固定为请求开始时的最新序号，越界 → 422 INVALID_SEQ；
+      所需历史修订未固化明细（结构引入前的修订）→ 422 SEGMENTS_UNAVAILABLE，
+      整次核对拒绝、不以当前状态推算；未知单号 → 404 MAINTENANCE_PLAN_NOT_FOUND。
+    """
+    result = services.verify_maintenance_plan(db, plan_no, seq)
+    return MaintenanceVerificationOut(
+        plan_no=result["plan_no"],
+        device_id=result["device_id"],
+        start=result["start"],
+        end=result["end"],
+        seq=result["seq"],
+        windows=[_maintenance_window_out(w) for w in result["windows"]],
+        settled_minutes=result["settled_minutes"],
+        executed=_maintenance_intervals(result["executed"]),
+        executed_minutes=result["executed_minutes"],
+        not_executed=_maintenance_intervals(result["not_executed"]),
+        not_executed_minutes=result["not_executed_minutes"],
+        unplanned=_maintenance_intervals(result["unplanned"]),
+        unplanned_minutes=result["unplanned_minutes"],
+        unverified=_maintenance_intervals(result["unverified"]),
+        unverified_minutes=result["unverified_minutes"],
+        shifts=[MaintenanceShiftRef(**ref) for ref in result["shifts"]],
+    )

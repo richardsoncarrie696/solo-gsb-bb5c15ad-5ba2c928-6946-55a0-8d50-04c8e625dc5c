@@ -733,3 +733,133 @@ class LossPeriodClosingOut(BaseModel):
     totals: ClosingTotals
     items: list[ClosingItemOut]
     created_at: datetime
+
+
+# ------------------------------------------------ 车间计划保养核对
+
+
+class MaintenanceWindowIn(_Interval):
+    """计划保养窗口（整分钟、半开、非空）；必须落在计划期间内且互不重叠。"""
+
+
+class MaintenancePlanIn(BaseModel):
+    """按设备提交计划保养单。
+
+    - 计划期间 [start, end) 带时区、整分钟、非空；windows 为非空保养窗口
+      列表，每个窗口必须完全落在期间内（可与端点对齐），窗口互不重叠
+      （端点相接允许）；
+    - 同设备已提交计划的期间不得与本单期间重叠（半开、相接允许）；
+    - 同单号同内容重试幂等（窗口换序、等价时区仍算同内容），异内容冲突；
+      提交后不可修改。
+    """
+
+    device_id: str = Field(min_length=1, max_length=64)
+    plan_no: str = Field(
+        min_length=1,
+        max_length=64,
+        description="计划单号（全局唯一；同单号同内容重试幂等，异内容冲突）",
+        examples=["MP-20261001-001"],
+    )
+    start: datetime = Field(description="计划期间起点（含），带时区整分钟")
+    end: datetime = Field(description="计划期间终点（不含），带时区整分钟")
+    windows: list[MaintenanceWindowIn] = Field(
+        min_length=1, description="非空保养窗口列表（顺序不影响同内容判定）"
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _ts(cls, v: datetime) -> datetime:
+        return _check_ts(v)
+
+    @model_validator(mode="after")
+    def _range(self):
+        if not self.start < self.end:
+            raise ValueError("invalid period: start must be earlier than end")
+        # 窗口落在期间内、互不重叠（半开、相接允许）：在 schema 层即拒绝，
+        # 服务层以 UTC 归一后再做一次同样的防御性校验。
+        period_start, period_end = self.start, self.end
+        ordered = sorted(
+            ((w.start, w.end) for w in self.windows),
+            key=lambda iv: (iv[0], iv[1]),
+        )
+        prev_end: datetime | None = None
+        for ws, we in ordered:
+            if ws < period_start or we > period_end:
+                raise ValueError(
+                    "maintenance window must be fully inside the plan period "
+                    "[start, end)"
+                )
+            if prev_end is not None and ws < prev_end:
+                raise ValueError(
+                    "maintenance windows must not overlap (half-open [start, end); "
+                    "touching is allowed)"
+                )
+            prev_end = we
+        return self
+
+
+class MaintenancePlanWindowOut(BaseModel):
+    """计划单读回的保养窗口（按 window_no/起点升序，UTC 输出）。"""
+
+    window_no: int
+    start: datetime
+    end: datetime
+    minutes: int
+
+
+class MaintenancePlanOut(BaseModel):
+    """一次固化的计划保养单（提交后不可改；同单号同内容重试原样返回）。"""
+
+    id: int
+    plan_no: str
+    device_id: str
+    idempotent: bool  # True 表示同单号同内容重试，返回原固化计划
+    start: datetime
+    end: datetime
+    windows: list[MaintenancePlanWindowOut]
+    created_at: datetime
+
+
+class MaintenanceInterval(BaseModel):
+    """核对结果中的最大连续区间（半开，UTC 输出）及分钟数。"""
+
+    start: datetime
+    end: datetime
+    minutes: int
+
+
+class MaintenanceShiftRef(BaseModel):
+    """核对所用的各已结算班次及其固定序号下选取的修订（便于重放核对）。"""
+
+    shift_id: int
+    revision: int
+    seq: int  # 该修订的全局变更序号（均 ≤ 核对所用序号）
+
+
+class MaintenanceVerificationOut(BaseModel):
+    """计划保养核对结果。
+
+    - executed：计划窗口与"保养"段交集（已执行）；
+    - not_executed：窗口内已结算但非保养的分钟（未执行）；
+    - unplanned：期间内窗口外的"保养"段（计划外）；
+    - unverified：计划窗口中未被已结算班次覆盖的分钟（未核实，不计未执行）；
+    - seq：本次实际使用的变更序号（未指定时固定为请求开始时的最新序号），
+      shifts 为所选班次修订依据，可凭此重放。
+    """
+
+    plan_no: str
+    device_id: str
+    start: datetime
+    end: datetime
+    seq: int
+    windows: list[MaintenancePlanWindowOut]
+    settled_minutes: int  # 期间内已结算班次覆盖的分钟总数
+    executed: list[MaintenanceInterval]
+    executed_minutes: int
+    not_executed: list[MaintenanceInterval]
+    not_executed_minutes: int
+    unplanned: list[MaintenanceInterval]
+    unplanned_minutes: int
+    unverified: list[MaintenanceInterval]
+    unverified_minutes: int
+    shifts: list[MaintenanceShiftRef]

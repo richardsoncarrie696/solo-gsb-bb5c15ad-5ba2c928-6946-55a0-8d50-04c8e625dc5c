@@ -562,6 +562,63 @@ class LossCostAllocationAccount(Base):
     )
 
 
+class MaintenancePlan(Base):
+    """车间按设备提交的计划保养单（提交后不可改，只追加）。
+
+    - plan_no 为调用方提供的**全局唯一**单号；device_id + 带时区整分钟的
+      半开计划期间 [start_ts, end_ts)；content_hash 为规范化提交内容
+      （窗口按起点升序、时间归一 UTC；窗口换序与等价时区不算差异）；
+    - 同设备的计划期间不得重叠（应用层校验 + gist 排他约束兜底，半开、
+      端点相接允许）；窗口必须完全落在期间内且互不重叠；
+    - 同单号同内容重试幂等返回原单，同单号异内容 409 冲突，提交后不提供
+      任何修改/删除接口（只追加）。核对按固定变更序号读取固化归因明细，
+      计划单本身不进入全局变更流。
+    """
+
+    __tablename__ = "maintenance_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    device_id: Mapped[str] = mapped_column(
+        ForeignKey("devices.id"), nullable=False, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("end_ts > start_ts", name="ck_maintenance_plans_valid_range"),
+    )
+
+
+class MaintenancePlanWindow(Base):
+    """计划保养单内的一个保养窗口：整分钟半开、非空、在期间内、互不重叠。
+
+    window_no 按起点升序自 1 起编号，保证读回顺序稳定；行随计划单同事务
+    写入，之后只读不可变。
+    """
+
+    __tablename__ = "maintenance_plan_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("maintenance_plans.id"), nullable=False, index=True
+    )
+    window_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("plan_id", "window_no", name="uq_maintenance_plan_window_no"),
+        CheckConstraint(
+            "end_ts > start_ts", name="ck_maintenance_plan_windows_valid_range"
+        ),
+    )
+
+
 class LossCostAllocationSplit(Base):
     """分摊来源明细：一条损失账切分明细 × 一个去向（某批次或未分配的一段区间）。
 

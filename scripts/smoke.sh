@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→按批次分摊停机成本→按设备期间停机损失结账 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→计划保养提交与核对→费率发布→停机损失核算→按批次分摊停机成本→按设备期间停机损失结账 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -206,6 +206,54 @@ req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00+
 echo "-- 对账非法窗口（缺时区 / start≥end）与未知设备：预期 422 / 404 --"
 req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00","end":"2026-10-02T00:00:00+08:00","field_intervals":[]}'
 req POST /devices/NOPE/downtime-reconciliation '{"start":"2026-10-02T00:00:00+08:00","end":"2026-10-01T00:00:00+08:00","field_intervals":[]}'
+
+echo "-- 计划保养提交：期间=班次 10/1 08:00-16:00，窗口 10:00-11:00 与 11:30-12:30（预期 201）--"
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-001","start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T16:00:00+08:00","windows":[
+  {"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"},
+  {"start":"2026-10-01T11:30:00+08:00","end":"2026-10-01T12:30:00+08:00"}]}'
+
+echo "-- 窗口换序重试：预期 200 幂等，idempotent=true（等价时区也视为同内容）--"
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-001","start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T16:00:00+08:00","windows":[
+  {"start":"2026-10-01T11:30:00+08:00","end":"2026-10-01T12:30:00+08:00"},
+  {"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"}]}'
+
+echo "-- 同单号异内容（改窗口）：预期 409 MAINTENANCE_PLAN_CONFLICT --"
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-001","start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T16:00:00+08:00","windows":[
+  {"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:30:00+08:00"}]}'
+
+echo "-- 窗口越出期间 / 窗口重叠 / 空窗口：预期 422 --"
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-BAD1","start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T16:00:00+08:00","windows":[
+  {"start":"2026-10-01T07:30:00+08:00","end":"2026-10-01T09:00:00+08:00"}]}'
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-BAD2","start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T16:00:00+08:00","windows":[
+  {"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:30:00+08:00"},
+  {"start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:00:00+08:00"}]}'
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-BAD3","start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T16:00:00+08:00","windows":[]}'
+
+echo "-- 同设备期间重叠：预期 409 MAINTENANCE_PLAN_OVERLAP；端点相接允许（201）--"
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-BAD4","start":"2026-10-01T15:00:00+08:00","end":"2026-10-01T20:00:00+08:00","windows":[
+  {"start":"2026-10-01T15:00:00+08:00","end":"2026-10-01T16:00:00+08:00"}]}'
+req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-DAY2","start":"2026-10-01T16:00:00+08:00","end":"2026-10-02T08:00:00+08:00","windows":[
+  {"start":"2026-10-01T20:00:00+08:00","end":"2026-10-01T21:00:00+08:00"}]}'
+
+echo "-- 按单号读取 / 按设备列出全部固化计划 --"
+req GET /maintenance-plans/MP-SMOKE-001
+req GET /devices/CNC-01/maintenance-plans
+
+echo "-- 核对：班次 1 当前固化明细中保养为 10:00-10:30 与 11:30-12:00；--"
+echo "-- 已执行两段各 30 分钟；10:30-11:00（被裁定改判故障）与 12:00-12:30（未停机）计未执行 --"
+req GET /maintenance-plans/MP-SMOKE-001/verification
+
+echo "-- 固定 seq=1 重放：当时保养为 10:00-11:00，已执行 60、未执行 60（11:30-12:30）--"
+req GET "/maintenance-plans/MP-SMOKE-001/verification?seq=1"
+
+echo "-- MP-SMOKE-DAY2 窗口 20:00-21:00 在已结算班次之外：全部计未核实（不计未执行）--"
+req GET /maintenance-plans/MP-SMOKE-DAY2/verification
+
+echo "-- 核对错误：未知单号 404 / 序号越界 422 INVALID_SEQ / 序号为负 422 / 未知设备列表 404 --"
+req GET /maintenance-plans/NOPE/verification
+req GET "/maintenance-plans/MP-SMOKE-001/verification?seq=999999"
+req GET "/maintenance-plans/MP-SMOKE-001/verification?seq=-1"
+req GET /devices/NOPE/maintenance-plans
 
 echo "-- 费率发布 v1（完整费率表；故障全天 1 元/分、保养 2 元/分、待判 0 元/分），预期 201 version=1 --"
 req POST /devices/CNC-01/rate-versions '{"note":"2026Q4","entries":[

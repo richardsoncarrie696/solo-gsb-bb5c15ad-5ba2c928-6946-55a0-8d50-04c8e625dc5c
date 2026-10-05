@@ -53,6 +53,7 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
     _migrate_adjudications()
     _migrate_segments()
     _create_rate_entries_exclusion_constraint()
+    _create_maintenance_plans_exclusion_constraint()
 
 
 def _create_rate_entries_exclusion_constraint() -> None:
@@ -87,6 +88,40 @@ def _create_rate_entries_exclusion_constraint() -> None:
     except SQLAlchemyError as exc:
         logger.warning(
             "btree_gist 不可用，未创建费率行排他约束（应用层重叠校验仍生效）：%s",
+            exc,
+        )
+
+
+def _create_maintenance_plans_exclusion_constraint() -> None:
+    """为保养计划增加同设备期间不重叠的排他约束（半开 [start,end)）。
+
+    应用层已在提交事务内逐单校验；该约束为并发/直写库场景兜底（与班次、
+    费率行约束一致）。依赖 btree_gist；缺失时降级为仅应用层校验。
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gist"))
+            conn.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        ALTER TABLE maintenance_plans
+                        ADD CONSTRAINT maintenance_plans_no_overlap_excl
+                        EXCLUDE USING gist (
+                            device_id WITH =,
+                            tstzrange(start_ts, end_ts, '[)') WITH &&
+                        );
+                    EXCEPTION WHEN duplicate_object OR duplicate_table THEN
+                        NULL;
+                    END
+                    $$;
+                    """
+                )
+            )
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "btree_gist 不可用，未创建保养计划排他约束（应用层重叠校验仍生效）：%s",
             exc,
         )
 
